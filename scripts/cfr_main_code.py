@@ -2,7 +2,10 @@ import cfr
 import yaml
 import os
 import math
+import gc
+import time
 import numpy as np
+import xarray as xr
 
 # Maximum ensemble members per sequential run.
 # Above this, nens is capped here and recon_seeds is expanded so that
@@ -10,6 +13,11 @@ import numpy as np
 # At the current prior regrid (42×63), nens=100 uses ~2 GB on top of the
 # ~5 GB prior download, comfortably within the 7 GB free-tier runner.
 NENS_BATCH = 100
+
+# Number of years per chunk when running the reconstruction.
+# Keeps peak memory below the 7 GB free-tier runner limit by avoiding
+# a single giant (nt, nens, nlat, nlon) array for the full period.
+CHUNK_YEARS = 500
 
 # Minimum observation error variance (floor on PSMmse).
 # Prevents kdenom = varye + ob_err → 0 when a proxy has near-zero MSE
@@ -66,16 +74,125 @@ for pid, pobj in job_cfg.proxydb.records.items():
 if n_floor:
     print(f'R floor: raised {n_floor} record(s) from PSMmse < {MIN_R} to {MIN_R}')
 
-# ── Phase 3: run DA ───────────────────────────────────────────────────────────
+# ── Phase 2.5: Auto-trim recon start year based on proxy coverage ───────────
+# cfr iterates over every year in recon_period regardless of proxy availability.
+# Years with zero/few proxies produce a flat reconstruction that just equals the
+# prior mean, which is misleading. Trim the start year to where proxy coverage
+# reaches a meaningful threshold.
+MIN_PROXIES_DEFAULT = 10
+min_proxies = base_config.get('min_proxies_for_recon', MIN_PROXIES_DEFAULT)
 cfg = job_cfg.configs
-job_cfg.run_da_mc(
-    recon_period=cfg['recon_period'],
-    recon_loc_rad=cfg['recon_loc_rad'],
-    recon_timescale=cfg.get('recon_timescale', 1),
-    recon_seeds=cfg.get('recon_seeds', [0]),
-    assim_frac=cfg.get('assim_frac', 0.75),
-    compress_params=cfg.get('compress_params', {'zlib': True}),
-    output_full_ens=cfg.get('output_full_ens', False),
-    output_indices=cfg.get('output_indices', None),
-    verbose=True,
-)
+recon_period = list(cfg['recon_period'])
+
+if min_proxies > 0 and len(job_cfg.proxydb.records) > 0:
+    start_yr, end_yr = int(recon_period[0]), int(recon_period[-1])
+    n_years = end_yr - start_yr + 1
+    coverage = np.zeros(n_years, dtype=int)
+    for pobj in job_cfg.proxydb.records.values():
+        t = getattr(pobj, 'time', None)
+        if t is None or len(t) == 0:
+            continue
+        proxy_years = np.unique(np.floor(np.asarray(t, dtype=float)).astype(int))
+        proxy_years = proxy_years[(proxy_years >= start_yr) & (proxy_years <= end_yr)]
+        coverage[proxy_years - start_yr] += 1
+
+    sufficient = np.where(coverage >= min_proxies)[0]
+    if len(sufficient) == 0:
+        print(f'WARNING: No year has >= {min_proxies} proxies '
+              f'(max coverage: {int(coverage.max())}). '
+              f'Running full period {start_yr}-{end_yr} as configured.')
+    else:
+        new_start = start_yr + int(sufficient[0])
+        if new_start > start_yr:
+            print(f'Auto-trim: proxy coverage >= {min_proxies} begins at year {new_start} '
+                  f'(was {start_yr}). Max coverage: {int(coverage.max())} proxies. '
+                  f'Updating recon_period to [{new_start}, {end_yr}].')
+            recon_period[0] = new_start
+            cfg['recon_period'] = recon_period
+        else:
+            print(f'Auto-trim: proxy coverage >= {min_proxies} at start year {start_yr}; '
+                  f'no trim needed.')
+
+# ── Phase 3: run DA (chunked to stay within 7 GB runner memory) ──────────────
+recon_period    = cfg['recon_period']
+recon_loc_rad   = cfg['recon_loc_rad']
+recon_timescale = cfg.get('recon_timescale', 1)
+recon_seeds     = cfg.get('recon_seeds', [0])
+assim_frac      = cfg.get('assim_frac', 0.75)
+compress_params = cfg.get('compress_params', {'zlib': True})
+output_full_ens = cfg.get('output_full_ens', False)
+output_indices  = cfg.get('output_indices', None)
+save_dirpath    = cfg.get('save_dirpath', '/recons')
+
+os.makedirs(save_dirpath, exist_ok=True)
+
+start_yr = int(recon_period[0])
+end_yr   = int(recon_period[-1])
+total_years = end_yr - start_yr + 1
+
+# Build chunk boundaries
+chunk_starts = list(range(start_yr, end_yr + 1, CHUNK_YEARS))
+chunks = [(cs, min(cs + CHUNK_YEARS - 1, end_yr)) for cs in chunk_starts]
+print(f'Chunked reconstruction: {len(chunks)} chunk(s) of up to {CHUNK_YEARS} years '
+      f'over [{start_yr}, {end_yr}]')
+
+t_s = time.time()
+
+for seed in recon_seeds:
+    print(f'>>> seed: {seed} | max: {recon_seeds[-1]}')
+
+    job_cfg.split_proxydb(seed=seed, assim_frac=assim_frac, verbose=False)
+
+    chunk_files = []
+    for ci, (c_start, c_end) in enumerate(chunks):
+        print(f'  chunk {ci+1}/{len(chunks)}: [{c_start}, {c_end}]')
+
+        job_cfg.run_da(
+            recon_period=[c_start, c_end],
+            recon_loc_rad=recon_loc_rad,
+            recon_timescale=recon_timescale,
+            nens=cfg.get('nens', NENS_BATCH),
+            seed=seed,
+            verbose=False,
+        )
+
+        chunk_path = os.path.join(save_dirpath, f'job_r{seed:02d}_chunk{ci:03d}.nc')
+        job_cfg.save_recon(
+            chunk_path,
+            compress_params=compress_params,
+            mark_assim_pids=(ci == 0),
+            verbose=False,
+            output_full_ens=output_full_ens,
+            grid='prior',
+            output_indices=output_indices,
+        )
+        chunk_files.append(chunk_path)
+
+        # Free the large arrays before the next chunk
+        job_cfg.recon_fields = {}
+        if hasattr(job_cfg, 'da_solver'):
+            del job_cfg.da_solver
+        gc.collect()
+
+    # Concatenate chunk files into the final per-seed NetCDF
+    final_path = os.path.join(save_dirpath, f'job_r{seed:02d}_recon.nc')
+    if len(chunk_files) == 1:
+        os.rename(chunk_files[0], final_path)
+    else:
+        datasets = [xr.open_dataset(f) for f in chunk_files]
+        combined = xr.concat(datasets, dim='time')
+        # Preserve attrs (pids_assim/pids_eval) from the first chunk
+        combined.attrs = datasets[0].attrs
+        for ds in datasets:
+            ds.close()
+        encoding = {v: compress_params for v in combined.data_vars}
+        combined.to_netcdf(final_path, encoding=encoding)
+        combined.close()
+        for f in chunk_files:
+            os.remove(f)
+
+    print(f'  saved: {final_path}')
+    gc.collect()
+
+t_used = time.time() - t_s
+print(f'>>> DONE! Total time spent: {t_used/60:.2f} mins.')
