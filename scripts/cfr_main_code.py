@@ -153,6 +153,11 @@ for seed in recon_seeds:
             recon_timescale=recon_timescale,
             nens=cfg.get('nens', NENS_BATCH),
             seed=seed,
+            # Disable trim_prior: cfr would otherwise restrict the prior
+            # sample pool to years within the chunk's recon_period, which
+            # is empty for chunks outside the prior's time range (e.g.
+            # chunk [0, 499] with a CCSM4 prior covering 850-1850).
+            trim_prior=False,
             verbose=False,
         )
 
