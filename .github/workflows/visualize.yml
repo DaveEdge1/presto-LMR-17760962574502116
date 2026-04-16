@@ -165,7 +165,7 @@ jobs:
   deploy-to-github-pages:
     name: Deploy to GitHub Pages
     needs: [find-latest-cfr-run, visualize, validate]
-    if: always() && (needs.visualize.result == 'success' || (inputs.validation_only == true && needs.validate.result == 'success'))
+    if: always() && needs.visualize.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       pages: write
