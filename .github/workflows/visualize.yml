@@ -7,6 +7,11 @@ on:
         description: 'Specific CFR run ID to visualize (default: latest run with an artifact)'
         required: false
         type: string
+      validation_only:
+        description: 'Run validation only (skip 90-min presto-viz)'
+        required: false
+        type: boolean
+        default: false
   workflow_run:
     workflows: ["LMR CFR Reconstruction"]
     types: [completed]
@@ -150,6 +155,7 @@ jobs:
   visualize:
     name: Generate Presto Visualization
     needs: [find-latest-cfr-run, download-cfr-artifact]
+    if: inputs.validation_only != true
     # uses: DaveEdge1/presto-viz/.github/workflows/presto-viz-reusable.yml@fix/cfr-dimension-order
     uses: DaveEdge1/presto-viz/.github/workflows/presto-viz-reusable.yml@main
     with:
@@ -159,7 +165,7 @@ jobs:
   deploy-to-github-pages:
     name: Deploy to GitHub Pages
     needs: [find-latest-cfr-run, visualize, validate]
-    if: always() && needs.visualize.result == 'success'
+    if: always() && (needs.visualize.result == 'success' || (inputs.validation_only == true && needs.validate.result == 'success'))
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -173,10 +179,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download visualization artifact
+        if: needs.visualize.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: presto-viz-output-CFR_Run_${{ needs.find-latest-cfr-run.outputs.run_number }}_Reviz_${{ github.run_number }}
           path: ./visualization-output
+
+      - name: Create output dir (validation-only mode)
+        if: needs.visualize.result != 'success'
+        run: mkdir -p ./visualization-output
 
       - name: Download validation artifact
         continue-on-error: true
@@ -194,12 +205,18 @@ jobs:
 
           # Copy icon images (committed to repo) into the deployment
           mkdir -p ./visualization-output/images
-          cp images/visualization.png images/validation.png ./visualization-output/images/
+          cp images/visualization.png images/validation.png ./visualization-output/images/ 2>/dev/null || true
 
           # Conditionally include the validation tile
           VALIDATION_TILE=""
           if [ -f "./visualization-output/validation/index.html" ]; then
             VALIDATION_TILE='<a class="tile" href="validation/index.html"><img src="images/validation.png" alt="Reconstruction Validation"><span>Reconstruction Validation</span></a>'
+          fi
+
+          # Conditionally include the visualization tile
+          VIZ_TILE=""
+          if [ -f "./visualization-output/docs/visualizer.html" ]; then
+            VIZ_TILE='<a class="tile" href="docs/visualizer.html"><img src="images/visualization.png" alt="Visualize Results"><span>Visualize Results</span></a>'
           fi
 
           cat > ./visualization-output/index.html << HTMLEOF
@@ -299,10 +316,7 @@ jobs:
             <main>
               <div class="tiles">
                 ${VALIDATION_TILE}
-                <a class="tile" href="docs/visualizer.html">
-                  <img src="images/visualization.png" alt="Visualize Results">
-                  <span>Visualize Results</span>
-                </a>
+                ${VIZ_TILE}
               </div>
             </main>
             <footer>
@@ -313,7 +327,7 @@ jobs:
           HTMLEOF
 
           ls -lah ./visualization-output/
-          ls -lah ./visualization-output/images/
+          ls -lah ./visualization-output/images/ 2>/dev/null || true
           ls -lah ./visualization-output/validation/ 2>/dev/null || echo "No validation output"
 
       - name: Setup Pages

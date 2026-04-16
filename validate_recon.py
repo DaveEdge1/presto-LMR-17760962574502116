@@ -399,6 +399,73 @@ plt.close(fig)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 6b. GMST Ensemble Members Plot (all iterations)
+# ═══════════════════════════════════════════════════════════════════════════
+print('Generating GMST ensemble members plot ...')
+n_ens = recon_val.shape[1]
+
+fig, ax = plt.subplots(figsize=(14, 6))
+
+# Plot every ensemble member as a thin translucent line
+# Cap at 200 members for readability; if more, subsample evenly
+max_lines = 200
+if n_ens <= max_lines:
+    plot_indices = range(n_ens)
+else:
+    plot_indices = np.linspace(0, n_ens - 1, max_lines, dtype=int)
+
+for i in plot_indices:
+    ax.plot(recon_time, recon_val[:, i], color='steelblue',
+            alpha=max(0.03, 3.0 / n_ens), lw=0.4)
+
+# Overlay median and quantiles
+ax.fill_between(recon_time, recon_q05, recon_q95,
+                alpha=0.15, color='navy', label='5-95% range')
+ax.plot(recon_time, recon_median, color='navy', lw=2,
+        label='Ensemble median')
+
+# Overlay instrumental
+ax.plot(obs_time, obs_1d, color='red', lw=1.5, label='GISTEMP', alpha=0.85)
+
+ax.set_xlabel('Year CE')
+ax.set_ylabel('Temperature Anomaly (\u00b0C)')
+ax.set_title(f'GMST: All {n_ens} Ensemble Members')
+ax.legend(loc='upper left')
+t_min = recon_time.min()
+ax.set_xlim(t_min, 2000)
+ax.axhline(0, color='gray', lw=0.5, alpha=0.5)
+fig.savefig(os.path.join(OUT_DIR, 'gmst_ensemble_members.png'),
+            dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+# Zoomed instrumental-period version
+fig, ax = plt.subplots(figsize=(14, 6))
+mask_t = (recon_time >= VALID_START) & (recon_time <= VALID_END)
+for i in plot_indices:
+    ax.plot(recon_time[mask_t], recon_val[mask_t, i], color='steelblue',
+            alpha=max(0.05, 5.0 / n_ens), lw=0.5)
+ax.fill_between(recon_time[mask_t], recon_q05[mask_t], recon_q95[mask_t],
+                alpha=0.15, color='navy', label='5-95% range')
+ax.plot(recon_time[mask_t], recon_median[mask_t], color='navy', lw=2,
+        label='Ensemble median')
+omask = (obs_time >= VALID_START) & (obs_time <= VALID_END)
+ax.plot(obs_time[omask], obs_1d[omask], color='red', lw=2,
+        label='GISTEMP', alpha=0.85)
+if has_hadcrut:
+    hmask = (had_time >= VALID_START) & (had_time <= VALID_END)
+    ax.plot(had_time[hmask], had_vals[hmask], color='green', lw=2,
+            ls='--', label='HadCRUT5', alpha=0.85)
+ax.set_xlabel('Year CE')
+ax.set_ylabel('Temperature Anomaly (\u00b0C)')
+ax.set_title(f'GMST Ensemble Members: Instrumental Period ({VALID_START}-{VALID_END})')
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+fig.savefig(os.path.join(OUT_DIR, 'gmst_ensemble_members_instrumental.png'),
+            dpi=150, bbox_inches='tight')
+plt.close(fig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 7. GMST Difference Plot (recon - LMRv2.1)
 # ═══════════════════════════════════════════════════════════════════════════
 if lmr_v21_time is not None:
@@ -652,6 +719,17 @@ html = f"""<!DOCTYPE html>
      compared against <span class="label-lmrv21">LMRv2.1</span>,
      <span class="label-gistemp">GISTEMP</span>{', and <span class="label-hadcrut">HadCRUT5</span>' if has_hadcrut else ''}.</p>
   <img src="gmst_timeseries.png" alt="GMST time series">
+
+  <h2>GMST Ensemble Members ({n_ens} total)</h2>
+  <p>Every ensemble member plotted individually, showing the full spread
+     of the reconstruction across all iterations and seeds.</p>
+  <img src="gmst_ensemble_members.png" alt="GMST all ensemble members">
+
+  <h3>Instrumental Period ({VALID_START}-{VALID_END})</h3>
+  <p>Zoomed view of ensemble members during the instrumental overlap period,
+     with <span class="label-gistemp">GISTEMP</span>{' and <span class="label-hadcrut">HadCRUT5</span>' if has_hadcrut else ''}
+     overlaid.</p>
+  <img src="gmst_ensemble_members_instrumental.png" alt="Ensemble members instrumental period">
 
   <h2>Instrumental Period Detail</h2>
   <p>Zoomed view of the validation period ({VALID_START}-{VALID_END}) with
